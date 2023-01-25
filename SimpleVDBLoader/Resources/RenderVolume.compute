@@ -1,0 +1,312 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma use_dxc
+#include "UnityCG.cginc"
+#define PI 3.14159
+#pragma kernel CSMain
+
+
+
+
+RWStructuredBuffer<uint2> ShadowBuffer;
+RWTexture2D<float4> Result;
+RWTexture3D<float> DDATextureWrite;
+Texture3D<float> DDATexture;
+float4x4 _CameraInverseProjection;
+float4x4 CameraToWorld;
+uint ScreenWidth;
+uint ScreenHeight;
+float3 Size;
+int LightCount;
+int CurFrame;
+
+struct UnityLight {
+    float3 Pos;
+    float3 Dir;
+    int Type;
+    float3 Col;
+};
+StructuredBuffer<UnityLight> UnityLights;
+
+
+struct Ray {
+    float3 origin;
+    float3 direction;
+};
+Ray CreateRay(float3 A, float3 B) {
+    Ray ray;
+    ray.origin = A;
+    ray.direction = B;
+    return ray;
+}
+Ray CreateCameraRay(float2 uv) {
+    // Transform the camera origin to world space
+    float3 origin = mul(CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+
+    // Invert the perspective projection of the view-space position
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    // Transform the direction from camera to world space and normalize
+    direction = mul(CameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+
+
+    return CreateRay(origin, direction);
+}
+
+uint hash_with(uint seed, uint hash) {
+    // Wang hash
+    seed = (seed ^ 61) ^ hash;
+    seed += seed << 3;
+    seed ^= seed >> 4;
+    seed *= 0x27d4eb2d;
+    return seed;
+}
+uint pcg_hash(uint seed) {
+    uint state = seed * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float2 random(uint samdim, uint pixel_index) {
+    uint hash = pcg_hash((pixel_index * (uint)204 + samdim));
+
+    const static float one_over_max_unsigned = asfloat(0x2f7fffff);
+
+
+    float x = hash_with(CurFrame, hash) * one_over_max_unsigned;
+    float y = hash_with(CurFrame + 0xdeadbeef, hash) * one_over_max_unsigned;
+
+    return float2(x, y);
+}
+
+uint packRGBE(float3 v)
+{
+    float3 va = max(0, v);
+    float max_abs = max(va.r, max(va.g, va.b));
+    if (max_abs == 0)
+        return 0;
+
+    float exponent = floor(log2(max_abs));
+
+    uint result;
+    result = uint(clamp(exponent + 20, 0, 31)) << 27;
+
+    float scale = pow(2, -exponent) * 256.0;
+    uint3 vu = min(511, round(va * scale));
+    result |= vu.r;
+    result |= vu.g << 9;
+    result |= vu.b << 18;
+
+    return result;
+}
+
+float3 unpackRGBE(uint x)
+{
+    int exponent = int(x >> 27) - 20;
+    float scale = pow(2, exponent) / 256.0;
+
+    float3 v;
+    v.r = float(x & 0x1ff) * scale;
+    v.g = float((x >> 9) & 0x1ff) * scale;
+    v.b = float((x >> 18) & 0x1ff) * scale;
+
+    return v;
+}
+
+
+float HenyeyGreenstein(float g, float mu) {
+    float gg = g * g;
+    return (1.0 / (4.0 * PI)) * ((1.0 - gg) / pow(1.0 + gg - 2.0 * g * mu, 1.5));
+}
+
+float DualHenyeyGreenstein(float g, float costh) {
+    return lerp(HenyeyGreenstein(-g, costh), HenyeyGreenstein(g, costh), 0.7f);
+}
+
+float PhaseFunction(float g, float costh) {
+    return DualHenyeyGreenstein(g, costh);
+}
+
+float3 MultipleOctaveScattering(float density, float mu) {
+    float attenuation = 0.2;
+    float contribution = 0.2;
+    float phaseAttenuation = 0.5;
+
+    float a = 1.0;
+    float b = 1.0;
+    float c = 1.0;
+    float g = 0.85;
+    const float scatteringOctaves = 4.0;
+
+    float3 luminance = 0.0;
+
+    for (float i = 0.0; i < scatteringOctaves; i++) {
+        float phaseFunction = PhaseFunction(0.3 * c, mu);
+        float3 beers = exp(-density * float3(0.8, 0.8, 1) * a);
+
+        luminance += b * phaseFunction * beers;
+
+        a *= attenuation;
+        b *= contribution;
+        c *= (1.0 - phaseAttenuation);
+    }
+    return luminance;
+}
+
+float inverseLerp(float minValue, float maxValue, float v) {
+    return (v - minValue) / (maxValue - minValue);
+}
+
+float remap(float v, float inMin, float inMax, float outMin, float outMax) {
+    float t = inverseLerp(inMin, inMax, v);
+    return lerp(outMin, outMax, t);
+}
+
+int ShadowDistanceOffset;
+
+
+inline bool rayBoxIntersection(const float3 ray_orig, const float3 inv_dir, const float3 Min, const float3 Max, float tMax, inout float t0, inout float t1) {
+    const float3 tmp_min = (Min - ray_orig) * inv_dir;
+    const float3 tmp_max = (Max - ray_orig) * inv_dir;
+    const float3 tmin = min(tmp_min, tmp_max);
+    const float3 tmax = max(tmp_min, tmp_max);
+    t0 = max(tmin.x, max(tmin.y, max(tmin.z, 0))); // Usually ray_tmin = 0
+    t1 = min(tmax.x, min(tmax.y, min(tmax.z, tMax)));
+    return (t0 <= t1);
+}
+
+inline float GetIndex(const int3 xyz) {
+    return DDATexture[xyz];
+}
+
+float3 SunDir;
+
+inline float MarchShadowDDA(int3 mapPos, const float3 rayDir, float MaxDist) {
+    float Density = 0;
+    float t0, t1;
+    if(rayBoxIntersection(mapPos, rcp(rayDir), 0, Size, MaxDist, t0, t1)) {
+        const float3 deltaDist = abs(rcp(rayDir)) * ShadowDistanceOffset;
+        const int3 rayStep = sign(rayDir) * ShadowDistanceOffset;
+        float3 sideDist = ((rayStep * 0.5) + 0.5) * deltaDist;
+
+        float minDist = min(min(sideDist.x, sideDist.y), sideDist.z);
+        bool3 mask;
+        while (minDist < t1) {
+            mask = (sideDist.xyz <= minDist);
+            sideDist += mask * deltaDist;
+            mapPos += mask * rayStep;
+            Density += GetIndex(mapPos) * ShadowDistanceOffset;
+            minDist = min(min(sideDist.x, sideDist.y), sideDist.z);
+            if (Density >= 100)
+                break;
+        }
+    }
+    return Density;
+}
+
+
+inline float3 MarchDDA(Ray ray, inout float3 Luminance) {
+    float t0, t1;
+    float3 Transmission = 1;
+    Luminance = 0;
+    float mu = dot(-ray.direction, SunDir);
+    if(rayBoxIntersection(ray.origin, rcp(ray.direction), 0, Size, 99999, t0, t1)) {
+        ray.origin += ray.direction * t0;
+        t1 = t1 - t0;
+        int3 mapPos = int3(floor(ray.origin));
+
+        const float3 deltaDist = abs(rcp(ray.direction));
+        
+        const int3 rayStep = int3(sign(ray.direction));
+
+        float3 sideDist = (rayStep * (mapPos - ray.origin) + (rayStep * 0.5) + 0.5) * deltaDist;
+
+        bool3 mask;
+        float minDist = min(min(sideDist.x, sideDist.y), sideDist.z);
+        
+        while(minDist < t1) {
+            mask = (sideDist.xyz <= min(sideDist.yzx, sideDist.zxy));
+            sideDist += mask * deltaDist;
+            minDist = min(min(sideDist.x, sideDist.y), sideDist.z);
+            mapPos += mask * rayStep;
+            float Density = GetIndex(mapPos);
+            if(Density > 0.01f) {
+                float LightDensity = asfloat(ShadowBuffer[mapPos.x + mapPos.y * Size.x + mapPos.z * Size.x * Size.y].x);
+                float3 beerslaw = MultipleOctaveScattering(LightDensity, mu);
+                float3 powder = 1.0f - exp(-LightDensity * 2 * float3(0.8, 0.8, 1));
+                // float3 transmittance = 0;
+                // float3 Radiance = GetSkyRadiance(mapPos, -SunDir, 0, -SunDir, transmittance);
+                float3 lum = unpackRGBE(ShadowBuffer[mapPos.x + mapPos.y * Size.x + mapPos.z * Size.x * Size.y].y) * beerslaw * lerp(2 * powder, 1, remap(mu, -1, 1, 0, 1));// * transmittance + Radiance;
+
+                float3 transmittance2 = exp(-Density * float3(0.8, 0.8, 1));
+                float3 integscatter = (lum - lum * transmittance2);
+
+                Luminance += integscatter * Transmission;
+                Transmission *= transmittance2;
+                if(Transmission.x < 0.01f) break;
+            }
+        }
+
+    }
+    return Transmission;
+}
+
+
+static const int2 PerFrameOffset[4] = {
+    {int2(0,0), int2(1,0), int2(0,1), int2(1,1)  }
+};
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    int2 ProperID = id.xy;/// * 2 + PerFrameOffset[CurFrame % 4];
+     float2 uv = float2((ProperID) / float2(ScreenWidth, ScreenHeight) * 2.0f - 1.0f);
+     Ray ray = CreateCameraRay(uv);
+     float3 Luminance;
+    float3 Sun = 0;//(saturate(max(min(exp(-acos(max(dot(-SunDir, -ray.direction), 0.0f))* 60.0f),12.0f),0) * transmittance));
+    if (dot(ray.direction, -SunDir) > cos(0.0235f / 2.0f)) {
+        Sun = saturate((1.5f / (PI * (0.0235f / 2.0f) * (0.0235f / 2.0f))));
+    }
+    float3 Transmission = MarchDDA(ray, Luminance);
+    Result[ProperID] = float4(0.1f * Transmission + Luminance + Sun * Transmission,1);
+    }
+
+
+#pragma kernel CopyToTexture
+StructuredBuffer<float4> NonZeroVoxels;
+
+[numthreads(1023,1,1)]
+void CopyToTexture (uint3 id : SV_DispatchThreadID)
+{
+    DDATextureWrite[NonZeroVoxels[id.x].xyz] = NonZeroVoxels[id.x].w;
+}
+
+#pragma kernel ShadeComputation
+[numthreads(1023,1,1)]
+void ShadeComputation (uint3 id : SV_DispatchThreadID)
+{
+    int LightSelection = floor(random(23, id.x).x * (LightCount));
+    float3 Dir;
+    float MaxDist;
+    switch(UnityLights[LightSelection].Type) {
+        case 0:
+            Dir = UnityLights[LightSelection].Pos - NonZeroVoxels[id.x].xyz;
+            MaxDist = length(Dir);
+            Dir /= MaxDist;
+        break;
+        case 1:
+            Dir = -UnityLights[LightSelection].Dir;
+            MaxDist = 99999.0f;
+        break;
+
+    }
+    ShadowBuffer[NonZeroVoxels[id.x].x + NonZeroVoxels[id.x].y * Size.x + NonZeroVoxels[id.x].z * Size.y * Size.x] = uint2(asuint(MarchShadowDDA(NonZeroVoxels[id.x].xyz, Dir, MaxDist)), packRGBE(UnityLights[LightSelection].Col));
+
+}
+
+#pragma kernel TextureZero
+
+[numthreads(8,8,8)]
+void TextureZero (uint3 id : SV_DispatchThreadID)
+{
+    DDATextureWrite[id.xyz] = 0;
+}
